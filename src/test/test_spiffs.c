@@ -110,7 +110,8 @@ static int mkpath(const char *path, mode_t mode) {
 }
 
 // end take
-
+//
+//
 char *make_test_fname(const char *name) {
   sprintf(_path, "%s/%s", TEST_PATH, name);
   return _path;
@@ -157,11 +158,13 @@ static s32_t _read(
   }
   if (addr < SPIFFS_CFG_PHYS_ADDR(&__fs)) {
     printf("FATAL read addr too low %08x < %08x\n", addr, SPIFFS_PHYS_ADDR);
-    exit(0);
+    ERREXIT();
+    return -1;
   }
   if (addr + size > SPIFFS_CFG_PHYS_ADDR(&__fs) + SPIFFS_CFG_PHYS_SZ(&__fs)) {
     printf("FATAL read addr too high %08x + %08x > %08x\n", addr, size, SPIFFS_PHYS_ADDR + SPIFFS_FLASH_SIZE);
-    exit(0);
+    ERREXIT();
+    return -1;
   }
   memcpy(dst, &AREA(addr), size);
   return 0;
@@ -187,21 +190,27 @@ static s32_t _write(
 
   if (addr < SPIFFS_CFG_PHYS_ADDR(&__fs)) {
     printf("FATAL write addr too low %08x < %08x\n", addr, SPIFFS_PHYS_ADDR);
-    exit(0);
+    ERREXIT();
+    return -1;
   }
   if (addr + size > SPIFFS_CFG_PHYS_ADDR(&__fs) + SPIFFS_CFG_PHYS_SZ(&__fs)) {
     printf("FATAL write addr too high %08x + %08x > %08x\n", addr, size, SPIFFS_PHYS_ADDR + SPIFFS_FLASH_SIZE);
-    exit(0);
+    ERREXIT();
+    return -1;
   }
 
   for (i = 0; i < size; i++) {
-    if (((addr + i) & (SPIFFS_CFG_LOG_PAGE_SZ(&__fs)-1)) != offsetof(spiffs_page_header, flags)) {
-      if (check_valid_flash && ((AREA(addr + i) ^ src[i]) & src[i])) {
-        printf("trying to write %02x to %02x at addr %08x\n", src[i], AREA(addr + i), addr+i);
-        spiffs_page_ix pix = (addr + i) / LOG_PAGE;
-        dump_page(&__fs, pix);
-        return -1;
-      }
+#if !SPIFFS_NO_BLIND_WRITES
+    if (((addr + i) & (SPIFFS_CFG_LOG_PAGE_SZ(&__fs)-1)) == offsetof(spiffs_page_header, flags)) {
+      /* Blind flag writes are allowed. */
+    } else
+#endif
+    if (check_valid_flash && ((AREA(addr + i) ^ src[i]) & src[i])) {
+      printf("trying to write %02x to %02x at addr %08x (as part of writing %d bytes to addr %08x)\n", src[i], AREA(addr + i), addr+i, size, addr);
+      spiffs_page_ix pix = (addr + i) / SPIFFS_CFG_LOG_PAGE_SZ(&__fs);
+      dump_page(&__fs, pix);
+      ERREXIT();
+      return -1;
     }
     AREA(addr + i) &= src[i];
   }
@@ -214,10 +223,12 @@ static s32_t _erase(
     u32_t addr, u32_t size) {
   if (addr & (SPIFFS_CFG_PHYS_ERASE_SZ(&__fs)-1)) {
     printf("trying to erase at addr %08x, out of boundary\n", addr);
+    ERREXIT();
     return -1;
   }
   if (size & (SPIFFS_CFG_PHYS_ERASE_SZ(&__fs)-1)) {
     printf("trying to erase at with size %08x, out of boundary\n", size);
+    ERREXIT();
     return -1;
   }
   _erases[(addr-SPIFFS_CFG_PHYS_ADDR(&__fs))/SPIFFS_CFG_PHYS_ERASE_SZ(&__fs)]++;
@@ -330,22 +341,25 @@ void area_read(u32_t addr, u8_t *buf, u32_t size) {
 
 void dump_erase_counts(spiffs *fs) {
   spiffs_block_ix bix;
+  spiffs_block_ix bix_offs;
   printf("  BLOCK     |\n");
   printf("   AGE COUNT|\n");
-  for (bix = 0; bix < fs->block_count; bix++) {
-    printf("----%3i ----|", bix);
-  }
-  printf("\n");
-  for (bix = 0; bix < fs->block_count; bix++) {
-    spiffs_obj_id erase_mark;
-    _spiffs_rd(fs, 0, 0, SPIFFS_ERASE_COUNT_PADDR(fs, bix), sizeof(spiffs_obj_id), (u8_t *)&erase_mark);
-    if (_erases[bix] == 0) {
-      printf("            |");
-    } else {
-      printf("%7i %4i|", (fs->max_erase_count - erase_mark), _erases[bix]);
+  for (bix_offs = 0; bix_offs < fs->block_count; bix_offs+=8) {
+    for (bix = bix_offs; bix < bix_offs+8 && bix < fs->block_count; bix++) {
+      printf("----%3i ----|", bix);
     }
+    printf("\n");
+    for (bix = bix_offs; bix < bix_offs+8 && bix < fs->block_count; bix++) {
+      spiffs_obj_id erase_mark;
+      _spiffs_rd(fs, 0, 0, SPIFFS_ERASE_COUNT_PADDR(fs, bix), sizeof(spiffs_obj_id), (u8_t *)&erase_mark);
+      if (_erases[bix] == 0) {
+        printf("            |");
+      } else {
+        printf("%7i %4i|", (fs->max_erase_count - erase_mark), _erases[bix]);
+      }
+    }
+    printf("\n");
   }
-  printf("\n");
 }
 
 void dump_flash_access_stats() {
@@ -354,6 +368,7 @@ void dump_flash_access_stats() {
 }
 
 
+static int check_cb_count;
 // static u32_t old_perc = 999;
 static void spiffs_check_cb_f(
 #if SPIFFS_HAL_CALLBACK_EXTRA
@@ -375,6 +390,7 @@ static void spiffs_check_cb_f(
     printf("%i%%\n", arg1 * 100 / 256);
   }*/
   if (report != SPIFFS_CHECK_PROGRESS) {
+    check_cb_count++;
     if (report != SPIFFS_CHECK_ERROR) fs_check_fixes++;
     printf("   check: ");
     switch (type) {
@@ -413,6 +429,7 @@ void fs_set_addr_offset(u32_t offset) {
 void test_lock(spiffs *fs) {
   if (_fs_locks != 0) {
     printf("FATAL: reentrant locks. Abort.\n");
+    ERREXIT();
     exit(-1);
   }
   _fs_locks++;
@@ -421,6 +438,7 @@ void test_lock(spiffs *fs) {
 void test_unlock(spiffs *fs) {
   if (_fs_locks != 1) {
     printf("FATAL: unlocking unlocked. Abort.\n");
+    ERREXIT();
     exit(-1);
   }
   _fs_locks--;
@@ -464,10 +482,12 @@ static void fs_create(u32_t spiflash_size,
   ASSERT(_fds != NULL, "testbench fd buffer could not be malloced");
   memset(_fds, 0, _fds_sz);
 
+#if SPIFFS_CACHE
   _cache_sz = sizeof(spiffs_cache) + cache_pages * (sizeof(spiffs_cache_page) + log_page_size);
   _cache = malloc(_cache_sz);
   ASSERT(_cache != NULL, "testbench cache could not be malloced");
   memset(_cache, 0, _cache_sz);
+#endif
 
   const u32_t work_sz = log_page_size * 2;
   _work = malloc(work_sz);
@@ -628,6 +648,14 @@ int read_and_verify_fd(spiffs_file fd, char *name) {
     printf("  read_and_verify: could not stat file %s\n", name);
     return res;
   }
+
+  off_t fsize = lseek(pfd, 0, SEEK_END);
+  if (s.size != fsize) {
+    printf("  read_and_verify: size differs, %s spiffs:%d!=fs:%ld\n", name, s.size, fsize);
+    return -1;
+  }
+  lseek(pfd, 0, SEEK_SET);
+
   if (s.size == 0) {
     SPIFFS_close(&__fs, fd);
     close(pfd);
@@ -841,10 +869,10 @@ u32_t get_spiffs_file_crc_by_fd(spiffs_file fd) {
 
   ASSERT(SPIFFS_lseek(FS, fd, 0, SPIFFS_SEEK_SET) >= 0, "could not seek to start of file");
 
-  while ((res = SPIFFS_read(FS, fd, buf, sizeof(buf))) >= SPIFFS_OK) {
+  while ((res = SPIFFS_read(FS, fd, buf, sizeof(buf))) > SPIFFS_OK) {
     crc = crc32(crc, buf, res);
   }
-  ASSERT(res == SPIFFS_ERR_END_OF_OBJECT || res == SPIFFS_OK, "failed reading file");
+  ASSERT(SPIFFS_errno(FS) == SPIFFS_ERR_END_OF_OBJECT || SPIFFS_errno(FS) == SPIFFS_OK, "failed reading file");
 
   return crc;
 }
@@ -905,14 +933,19 @@ void _teardown() {
 #endif
     dump_erase_counts(FS);
     printf("  fs consistency check output begin\n");
+    check_cb_count = 0;
     SPIFFS_check(FS);
     printf("  fs consistency check output end\n");
+    if (check_cb_count) {
+      ERREXIT();
+    }
   }
   clear_test_path();
   fs_free();
   printf("  locks : %i\n", _fs_locks);
   if (_fs_locks != 0) {
     printf("FATAL: lock asymmetry. Abort.\n");
+    ERREXIT();
     exit(-1);
   }
 }
@@ -1069,5 +1102,13 @@ int run_file_config(int cfg_count, tfile_conf* cfgs, int max_runs, int max_concu
   return 0;
 }
 
-
-
+int count_taken_fds(spiffs *fs) {
+  int i;
+  spiffs_fd *fds = (spiffs_fd *)fs->fd_space;
+  int taken = 0;
+  for (i = 0; i < fs->fd_count; i++) {
+    spiffs_fd *cur_fd = &fds[i];
+    if (cur_fd->file_nbr) taken++;
+  }
+  return taken;
+}
